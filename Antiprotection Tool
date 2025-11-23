@@ -1,0 +1,477 @@
+// ==UserScript==
+// @name         Privacy Lite — safe tracker reduction (non-destructive)
+// @namespace    https://example.local/privacy-lite
+// @version      1.2.0
+// @description  Reduce passive tracking: strip tracking query params, block common tracker scripts/requests, add tiny canvas noise, cosmetic UA tweak, mild non-security navigator randomization. Safe defaults; non-destructive.
+// @author       You
+// @match        *://*/*
+// @run-at       document-start
+// @grant        none
+// ==/UserScript==
+
+/* CONFIG — tune these safely
+   - All settings default to conservative, low-impact behavior.
+   - Avoid enabling anything you think might break specific web apps; you can toggle features as desired.
+*/
+const CONFIG = {
+  stripQueryParams: true, // remove utm_*, fbclid, gclid, etc. from URL and links
+  blockTrackers: true, // block known tracker script inserts and network requests (see list below)
+  trackerBlocklist: [ // minimal, common trackers; safe-mode: excludes auth providers
+    "google-analytics.com",
+    "analytics.google.com",
+    "googletagmanager.com",
+    "gtag/js",
+    "doubleclick.net",
+    "facebook.net",
+    "connect.facebook.net",
+    "facebook.com/tr",
+    "ads.twitter.com",
+    "ads.linkedin.com",
+    "linkedin.com/px",
+    "segment.io",
+    "mixpanel.com",
+    "hotjar.com",
+    "static.hotjar.com",
+    "fullstory.com",
+    "amplitude.com",
+    "intercom.io",
+    "mc.yandex.ru",
+    "yandex.ru",
+    "optimizely",
+    "heap.io"
+  ],
+  canvasNoise: {
+    enabled: true,
+    maxPerComponent: 2, // max added/subtracted to each R/G/B component (0-255). 2 is very small and non-destructive.
+    sessionSeeded: true // keeps noise consistent during the session (reduces breakage while still adding privacy)
+  },
+  userAgentTweak: {
+    enabled: true,
+    // By default we append a short cosmetic token; keep major tokens intact so sites keep working.
+    appendToken: " PrivacyLite/1.2"
+  },
+  navigatorRandomization: {
+    enabled: true,
+    // Mild randomization of non-security-critical fields. This is deliberately restrained.
+    languagesPool: [["en-US","en"], ["en-GB","en"], ["fr-FR","fr"], ["de-DE","de"], ["es-ES","es"]],
+    platformPool: ["Win32","Linux x86_64","MacIntel","Android"],
+    // Keep vendor & major UA tokens unchanged.
+  },
+  linkRewriteDelayMs: 50 // milliseconds between page load and initial link rewrite (small delay to let site content settle)
+};
+
+// Utility: safe logger that prefixes messages; disabled in production by editing this flag.
+const DEBUG = false;
+function log(...args){ if(DEBUG) console.log("[PrivacyLite]", ...args); }
+
+/* ---- Helpers ---- */
+
+// Make deterministic-ish session seed
+function sessionSeed() {
+  try {
+    // use sessionStorage if available
+    if (CONFIG.canvasNoise.sessionSeeded && window.sessionStorage) {
+      let s = sessionStorage.getItem("privacy_lite_seed");
+      if (!s) {
+        s = Math.floor(Math.random()*1e9).toString();
+        sessionStorage.setItem("privacy_lite_seed", s);
+      }
+      return Number(s);
+    }
+  } catch(e){/* ignore */ }
+  return Math.floor(Math.random()*1e9);
+}
+const _SEED = sessionSeed();
+
+// small PRNG (xorshift32)
+function xorshift32(seed) {
+  let x = seed >>> 0;
+  return function() {
+    x ^= x << 13; x >>>= 0;
+    x ^= x >>> 17;
+    x ^= x << 5; x >>>= 0;
+    return x >>> 0;
+  };
+}
+const rnd = xorshift32(_SEED);
+
+/* ---- Core behaviors injected into the page context ----
+   Some properties (navigator, canvas prototypes) are only accessible from page JS, not from the
+   userscript sandbox; therefore we inject a single <script> with the logic that runs in page context.
+*/
+(function inject() {
+  const script = document.createElement("script");
+  script.setAttribute("type", "text/javascript");
+
+  // Inline the logic with CONFIG serialized (safe small object)
+  script.textContent = `(function(){
+    const CONFIG = ${JSON.stringify(CONFIG)};
+    const SEED = ${_SEED};
+
+    // tiny PRNG for deterministic session noise
+    function xorshift32(seed){
+      let x = seed >>> 0;
+      return function(){
+        x ^= x << 13; x >>>= 0;
+        x ^= x >>> 17;
+        x ^= x << 5; x >>>= 0;
+        return x >>> 0;
+      };
+    }
+    const rnd = xorshift32(SEED);
+
+    function safeTry(fn){
+      try{ fn(); }catch(e){ /* swallow to avoid breaking page */ }
+    }
+
+    /* --- USER AGENT cosmetic tweak ---
+       Keep all major tokens intact but append a cosmetic token if enabled.
+       We override the read-only getter of navigator.userAgent in a non-invasive way.
+    */
+    safeTry(function(){
+      if(CONFIG.userAgentTweak && CONFIG.userAgentTweak.enabled){
+        const append = CONFIG.userAgentTweak.appendToken || "";
+        const originalUA = navigator.userAgent || "";
+        const modifiedUA = originalUA + append;
+        try {
+          // define getter on Navigator.prototype if possible
+          const NP = Object.getPrototypeOf(navigator);
+          if(NP && NP.hasOwnProperty("userAgent")){
+            Object.defineProperty(NP, "userAgent", {
+              get: function(){ return modifiedUA; },
+              configurable: true
+            });
+          } else {
+            // fallback: define on window.navigator
+            Object.defineProperty(window.navigator, "userAgent", {
+              get: function(){ return modifiedUA; },
+              configurable: true
+            });
+          }
+        } catch (e) {
+          // last resort: assign (may fail under strict policies)
+          try { window.navigator.__defineGetter__("userAgent", ()=>modifiedUA); }catch(e){}
+        }
+      }
+    });
+
+    /* --- Mild navigator randomization (non-security-critical) ---
+       Randomize languages and platform from small pools. This is intentionally mild.
+    */
+    safeTry(function(){
+      if(CONFIG.navigatorRandomization && CONFIG.navigatorRandomization.enabled){
+        const NP = Object.getPrototypeOf(navigator);
+        // languages
+        try{
+          const pool = CONFIG.navigatorRandomization.languagesPool || [];
+          if(pool.length){
+            const pick = pool[(rnd() % pool.length)];
+            if(pick && Array.isArray(pick)){
+              Object.defineProperty(NP, "languages", { get: ()=> pick, configurable: true });
+            }
+          }
+        }catch(e){}
+        // platform
+        try{
+          const ppool = CONFIG.navigatorRandomization.platformPool || [];
+          if(ppool.length){
+            const plat = ppool[rnd() % ppool.length];
+            Object.defineProperty(NP, "platform", { get: ()=> plat, configurable: true });
+          }
+        }catch(e){}
+        // doNotTrack and cookie support left untouched
+      }
+    });
+
+    /* --- Canvas noise (2D only). ---
+       We intercept CanvasRenderingContext2D.prototype.getImageData and HTMLCanvasElement.toDataURL
+       to add a tiny, bounded modification to pixel values. The change is deliberately small (few units)
+       so that normal use (images, drawings) is almost unaffected while canvas fingerprinting is perturbed.
+    */
+    safeTry(function(){
+      if(CONFIG.canvasNoise && CONFIG.canvasNoise.enabled){
+        const maxComp = Math.max(0, Math.min(5, CONFIG.canvasNoise.maxPerComponent || 2)); // 0..5 clamp
+        const seed = SEED;
+        const prng = xorshift32(seed);
+        // helper: apply tiny noise to ImageData
+        function applyNoiseToImageData(imageData){
+          const data = imageData.data;
+          // use local pseudo-random for this call
+          let local = prng();
+          for(let i=0; i<data.length; i+=4){
+            // very small tweaks, symmetric around zero
+            data[i]   = Math.min(255, Math.max(0, data[i]   + ((local = (local*1664525 + 1013904223) >>> 0) % (2*maxComp+1)) - maxComp));
+            data[i+1] = Math.min(255, Math.max(0, data[i+1] + ((local = (local*1664525 + 1013904223) >>> 0) % (2*maxComp+1)) - maxComp));
+            data[i+2] = Math.min(255, Math.max(0, data[i+2] + ((local = (local*1664525 + 1013904223) >>> 0) % (2*maxComp+1)) - maxComp));
+            // leave alpha untouched to avoid compositing issues
+          }
+          return imageData;
+        }
+
+        // wrap getImageData
+        const ctxProto = CanvasRenderingContext2D && CanvasRenderingContext2D.prototype;
+        if(ctxProto && ctxProto.getImageData){
+          const originalGet = ctxProto.getImageData;
+          ctxProto.getImageData = function(...args){
+            const im = originalGet.apply(this, args);
+            try{
+              return applyNoiseToImageData(im);
+            }catch(e){ return im; }
+          };
+        }
+
+        // wrap toDataURL on canvas element (calls internal getImageData in many cases)
+        const cProto = HTMLCanvasElement && HTMLCanvasElement.prototype;
+        if(cProto && cProto.toDataURL){
+          const originalToDataURL = cProto.toDataURL;
+          cProto.toDataURL = function(...args){
+            try{
+              // create temporary context copy and draw, then call originalToDataURL. This avoids modifying canvas displayed to user.
+              const w = this.width, h = this.height;
+              if(w && h && w*h < 10000*100){ // avoid huge canvases (very large pixel counts); heuristic
+                const temp = document.createElement("canvas");
+                temp.width = w; temp.height = h;
+                const ctx = temp.getContext("2d");
+                if(ctx){
+                  ctx.drawImage(this, 0, 0);
+                  try {
+                    const imgd = ctx.getImageData(0,0,w,h);
+                    ctx.putImageData(applyNoiseToImageData(imgd),0,0);
+                    return originalToDataURL.apply(temp, args);
+                  } catch(e) {
+                    // fallback to original if something fails
+                    return originalToDataURL.apply(this, args);
+                  }
+                }
+              }
+            }catch(e){}
+            return originalToDataURL.apply(this, args);
+          };
+        }
+      }
+    });
+
+    /* --- Block tracker scripts & network requests (conservative) ---
+       We intercept:
+         - insertion of <script> elements (remove/neutralize if src matches blocklist)
+         - fetch() and XMLHttpRequest to block requests to tracker domains
+       This is intentionally conservative: only blocks items containing listed substrings.
+    */
+    safeTry(function(){
+      if(CONFIG.blockTrackers && Array.isArray(CONFIG.trackerBlocklist) && CONFIG.trackerBlocklist.length){
+        const blocked = CONFIG.trackerBlocklist.map(s=>s.toLowerCase());
+
+        // Utility to check URL for a blocked substring
+        function isBlockedUrl(url){
+          if(!url) return false;
+          const lu = url.toLowerCase();
+          return blocked.some(b => lu.indexOf(b) !== -1);
+        }
+
+        // Observe new script nodes and neutralize them before they load
+        const observer = new MutationObserver(function(muts){
+          for(const m of muts){
+            for(const node of m.addedNodes){
+              try{
+                if(node && node.tagName === "SCRIPT"){
+                  const src = node.src || "";
+                  if(isBlockedUrl(src)){
+                    // neutralize: remove src and set type so it won't execute
+                    node.type = "javascript/blocked";
+                    node.removeAttribute("src");
+                    node.textContent = "";
+                    node.parentNode && node.parentNode.removeChild(node);
+                  }
+                }
+                // also check if node is an element that contains scripts as descendants
+                if(node && node.querySelectorAll){
+                  const scripts = node.querySelectorAll("script");
+                  scripts.forEach(s => {
+                    const src = s.src || "";
+                    if(isBlockedUrl(src)){
+                      s.type = "javascript/blocked";
+                      s.removeAttribute("src");
+                      s.textContent = "";
+                      s.parentNode && s.parentNode.removeChild(s);
+                    }
+                  });
+                }
+              }catch(e){}
+            }
+          }
+        });
+        observer.observe(document, { childList: true, subtree: true });
+
+        // Intercept appendChild/insertBefore for early prevention
+        const origAppend = Element.prototype.appendChild;
+        Element.prototype.appendChild = function(child){
+          try{
+            if(child && child.tagName === "SCRIPT" && isBlockedUrl(child.src)){
+              // neutralize
+              child.type = "javascript/blocked";
+              child.removeAttribute("src");
+              child.textContent = "";
+              return child;
+            }
+          }catch(e){}
+          return origAppend.call(this, child);
+        };
+        const origInsert = Element.prototype.insertBefore;
+        Element.prototype.insertBefore = function(newNode, refNode){
+          try{
+            if(newNode && newNode.tagName === "SCRIPT" && isBlockedUrl(newNode.src)){
+              newNode.type = "javascript/blocked";
+              newNode.removeAttribute("src");
+              newNode.textContent = "";
+              return newNode;
+            }
+          }catch(e){}
+          return origInsert.call(this, newNode, refNode);
+        };
+
+        // Intercept fetch to block network calls to trackers
+        const origFetch = window.fetch;
+        window.fetch = function(input, init){
+          try{
+            const url = (typeof input === "string") ? input : (input && input.url) || "";
+            if(isBlockedUrl(url)) {
+              // silently fail with a resolved Response with empty body to avoid site errors
+              log("Blocking fetch to", url);
+              return Promise.resolve(new Response("", {status: 204, statusText: "No Content"}));
+            }
+          }catch(e){}
+          return origFetch.apply(this, arguments);
+        };
+
+        // Intercept XHR
+        const OrigXHR = window.XMLHttpRequest;
+        function WrappedXHR(){
+          const xhr = new OrigXHR();
+          const origOpen = xhr.open;
+          xhr.open = function(method, url){
+            try{
+              if(isBlockedUrl(url)){
+                // prevent real network call by turning on an internal flag
+                xhr._blocked = true;
+                log("Blocking XHR to", url);
+              }
+            }catch(e){}
+            return origOpen.apply(xhr, arguments);
+          };
+          const origSend = xhr.send;
+          xhr.send = function(){
+            if(xhr._blocked){
+              // emulate completed request with empty response
+              try{
+                setTimeout(()=> {
+                  xhr.readyState = 4;
+                  xhr.status = 204;
+                  if(typeof xhr.onreadystatechange === "function") xhr.onreadystatechange();
+                  if(typeof xhr.onload === "function") xhr.onload();
+                }, 0);
+                return;
+              } catch(e){}
+            }
+            return origSend.apply(xhr, arguments);
+          };
+          return xhr;
+        }
+        window.XMLHttpRequest = WrappedXHR;
+      }
+    });
+
+    /* --- Strip tracking query parameters from URL and links --- */
+    safeTry(function(){
+      if(CONFIG.stripQueryParams){
+        const paramsToRemove = ["utm_source","utm_medium","utm_campaign","utm_term","utm_content","utm_name","utm_cid","utm_reader","utm_viz_id","gclid","fbclid","mc_cid","mc_eid","igshid"];
+        function stripUrlTracking(urlString){
+          try{
+            const url = new URL(urlString, location.href);
+            let changed = false;
+            for(const p of paramsToRemove){
+              if(url.searchParams.has(p)){ url.searchParams.delete(p); changed = true; }
+            }
+            // remove empty trailing '?'
+            if(changed) return url.pathname + url.search + url.hash;
+          }catch(e){}
+          return null;
+        }
+
+        // Replace current location without reload if needed (preserve hash)
+        (function replaceCurrent(){
+          try{
+            const cur = location.href;
+            const stripped = stripUrlTracking(cur);
+            if(stripped){
+              history.replaceState(null,"", stripped);
+            }
+          }catch(e){}
+        })();
+
+        // Rewrite anchor hrefs proactively and for dynamically added links
+        function rewriteAnchor(a){
+          try{
+            if(!a || !a.href) return;
+            const newHref = stripUrlTracking(a.href);
+            if(newHref) a.href = newHref;
+          }catch(e){}
+        }
+        function rewriteAllAnchors(){
+          try{
+            document.querySelectorAll("a[href]").forEach(rewriteAnchor);
+          }catch(e){}
+        }
+
+        // initial rewrite after a tiny delay to let scripts create links
+        setTimeout(rewriteAllAnchors, ${CONFIG.linkRewriteDelayMs});
+
+        // Observe for dynamically added links
+        const obs = new MutationObserver(function(muts){
+          for(const m of muts){
+            if(m.addedNodes && m.addedNodes.length){
+              m.addedNodes.forEach(node=>{
+                try{
+                  if(node.nodeType === 1){
+                    if(node.matches && node.matches("a[href]")) rewriteAnchor(node);
+                    node.querySelectorAll && node.querySelectorAll("a[href]").forEach(rewriteAnchor);
+                  }
+                }catch(e){}
+              });
+            }
+          }
+        });
+        obs.observe(document.documentElement || document, { childList:true, subtree:true });
+      }
+    });
+
+    // done
+  })();`;
+
+  // Insert as early as possible
+  const root = document.documentElement || document;
+  if(root && root.firstChild) root.insertBefore(script, root.firstChild);
+  else document.documentElement.appendChild(script);
+  // remove the injector node to avoid clutter
+  setTimeout(()=> script.remove(), 5000);
+})();
+
+/* ---- Userscript-side helpers and notes ----
+   We also run a small content script layer for early DOM tasks (safe, non-invasive).
+*/
+(function contentLayer(){
+  // Simple console prefix
+  function log(...args){ if(false) console.log("[PrivacyLite]", ...args); }
+
+  // Nothing heavy here; primary logic runs in page context via injected script above.
+  log("PrivacyLite content-layer initialized.");
+})();
+
+/* ---- Safety & Notes ----
+ - This script:
+    • is conservative: default blocklist is limited and avoids core auth domains.
+    • uses tiny canvas noise (maxPerComponent default 2) to reduce fingerprinting without breaking drawings.
+    • appends a cosmetic UA token by default; you can disable this in CONFIG.userAgentTweak.enabled.
+    • randomizes only non-security-critical navigator values (languages/platform) from small pools.
+ - If a website breaks (login, payments, maps, webcams), temporarily disable the script on that site.
+ - Do not enable aggressive blocklists unless you know the site is safe to restrict.
+*/
