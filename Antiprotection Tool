@@ -3,7 +3,7 @@
 // @namespace    https://example.local/privacy-lite
 // @version      1.2.0
 // @description  Reduce passive tracking: strip tracking query params, block common tracker scripts/requests, add tiny canvas noise, cosmetic UA tweak, mild non-security navigator randomization. Safe defaults; non-destructive.
-// @author       You
+// @author       kmkl
 // @match        *://*/*
 // @run-at       document-start
 // @grant        none
